@@ -1,0 +1,32 @@
+That is a pass on the mechanism. Bit-exact on 754/754 is the hard part, and 83.1% probe accuracy at L=8 with a 21% byte cut is a real signal.
+
+**Against the gate**
+
+- Probe ≥ 0.75: pass (83.1%).
+- Bytes ≥ 20%: pass (21.3% at C=16).
+- τ loss ≤ 5%: fail (9.7%).
+
+So the mechanism works and the policy is too aggressive.
+
+**What the τ loss means**
+
+The prune keeps one sibling. Every probe miss (about 17% of picks) throws away a pass that would have accepted 2 tokens, so that pass yields 1. Bytes per output token already includes that cost, so the 21% is net. But τ loss is not free in all regimes: when bandwidth is binding, tokens/sec moves with bytes per token, so this is a ~27% win. When latency per pass is binding (HBM, small expert cost), 10% more passes is a 10% slowdown. The paper has to show both axes.
+
+**The fix is a knob, not a redesign**
+
+Keep-1 is the most aggressive point on a curve. Three cheaper points, all replayable from the logs with no new forward passes:
+- Keep top-2 siblings instead of top-1. Probe top-2 is likely well above 95%, so τ loss should drop under 3%, and most of the byte saving stays because 2 rows are dropped instead of 3.
+- Confidence gate: keep-1 only when the probe's margin is above a threshold, else keep-2 or keep-all. This is the Limits paper's cost-ratio rule in practice.
+- Later L. L=11 of 16 will have higher accuracy and a smaller saving.
+
+Ask Claude Code to produce the Pareto curve: bytes per output token vs τ, for keep-k ∈ {1, 2, 3}, a confidence-threshold sweep, L ∈ {4, 5, 8, 11}, C ∈ {8, 16, 32}. That is the main figure of the paper, and it is offline.
+
+**Two caveats that stay in the write-up**
+
+- The drafter is untrained ESP. Its siblings are easy to tell apart. With the trained mask path (93% depth-1 acceptance on Qwen3), all four siblings are plausible and the probe gets harder. The trained-drafter run is the next GPU session, ~2.5 h.
+- Simulated bytes only. The offloaded wall-clock run (experts on CPU, on-demand load) is needed before any claim about speed. Simulated bytes is the right metric for the mechanism; it is not the paper's headline on its own.
+
+**Immediate asks**
+
+1. Confirm the source is pushed to the private repo and the logs are off the box.
+2. Run the Pareto replay now. If keep-2 at L=8 gives ≥ 15% bytes at ≤ 4% τ loss, the gate is met and we move to the trained drafter.
