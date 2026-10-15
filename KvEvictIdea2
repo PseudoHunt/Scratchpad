@@ -1,0 +1,164 @@
+# Research handoff: Idea 2 — a shareable, reversible KV cache (prefix-closed compression + score-aware index over an offloaded cache)
+
+This is a complete, self-contained brief for a new Claude session (chat and Claude Code) with no history of the project. It contains the motivation, the definitions, the system, the prior art, the kill gates, and the first instructions. Read it fully before touching any code.
+
+---
+
+## 1. One-paragraph summary
+
+Serving engines do not deploy KV-cache compression because every published method breaks the two things engines depend on: **prefix caching** (storing a shared prompt's KV once and reusing it across requests) and a **stable, rectangular memory layout** (every head the same length, so paged kernels and the scheduler stay simple). This project builds a cache that engines can actually share and recover. It has two pieces. (1) **Prefix-closed compression**: an eviction rule whose decisions depend only on a bounded lookahead and a fixed count, so the compressed cache of a shared prefix is identical for every request that starts with it; a cache hit returns exactly what a miss would build. (2) **A score-aware low-rank index over an offloaded cache**: the full KV lives in host memory, a compact index on the GPU decides which tokens to fetch each step, nothing is ever lost, and the index itself is prefix-closed by construction. CrossCov-U, the owner's existing Loki-style covariance-weighted key projection, is the index. The one-line claim: "A KV cache that engines can share and recover: prefix-closed, reversible, on stock kernels, with a score-aware index that makes offloading fast."
+
+---
+
+## 2. Background the new session needs
+
+### 2.1 What the owner already has
+- **CrossCov-U**: a KV-selection method built on Loki (arXiv 2406.02542). It projects keys to a low-rank basis chosen by a cross-covariance criterion (score-aware, not plain PCA) and scores queries against the projected keys to select which tokens attend. Its known problem: on a GPU-resident cache it gives **no wall-clock speedup**, for the same reason Loki does not (Loki measured ~1.45x attention-only versus 2.6x theoretical, no end-to-end gain). SAKI (arXiv 2608.03228, Aug 2026) is near-duplicate prior art for the projection itself: a closed-form covariance-weighted rank-r score map that raised top-64 recall from 0.748 to 0.799 at r=32 over PCA, with no timing results. So the projection is not the contribution; the runtime and the sharing property are.
+- **A harness from the previous project** (the `neymankv` repository on GitHub under PseudoHunt): capture hooks for pre- and post-RoPE keys, values and queries; a kvpress-based long-context evaluation pipeline (RULER, LooGLE) with paired bootstrap statistics; a decode engine with a per-token logit-bias path; synthetic test scaffolding. Reuse the capture, evaluation and statistics code. Ignore the eviction methods in it (they were null results).
+- **A RoPE kernel-factorization repository** (github.com/PseudoHunt/rope-kv-compression) with RoPE handling utilities (inverse rotation, per-frequency analysis). Useful for the pre-RoPE index.
+
+### 2.2 What the serving literature says (verified in the Oct 2026 survey)
+- Compaction-style eviction drops prefix-hit rates to **0-3%**; IntentKV (arXiv 2606.09916) keeps 20.7% by masking evicted slots, but that does not free the memory.
+- vLLM's prefix-caching RFC (#2614) hashes only complete blocks and warned that eviction "may randomly free a block in the middle of a prefix"; a later sparse-KV RFC (#12254) says token dropping is hard to combine with prefix caching, and a maintainer suggested waiting until a major lab adopts it.
+- What shipped in 2026 avoids the conflict: TensorRT-LLM's TriAttention compacts **generated tokens only** and preserves the prompt; SGLang's HiSparse (arXiv 2608.07009) **offloads inactive KV to host memory instead of evicting**, with its PD-colocation example running with `--disable-radix-cache`; vLLM's hybrid KV manager and SGLang's unified radix cache (Aug 2026) combine prefix caching only with position-based sliding windows.
+- Non-uniform per-head lengths are the second blocker: Tangram (arXiv 2606.06302) measured page reclaiming at up to 25% of prefill time, decode stragglers up to 1.7x, and 15-20% of each decode step in CPU re-planning. KVzap's authors state no pruning method had been integrated into major engines.
+- Sparsity turns into throughput only when the full cache leaves HBM (SparseServe 2509.24626, HiSparse, SparDA 2606.04511, NOSA 2510.13602). Fathom (arXiv 2609.17652) beats Loki/SparQ/Double-Sparsity-style index scans by 1.67x, but **only when the index is offloaded**; it reports no gain when GPU-resident. Break-even for GPU-resident sparse decode is about 10x sparsity (arXiv 2605.24168).
+- The survey's conclusion, which this project takes as its design brief: **prefix compatibility and reversibility are the real adoption criteria.**
+
+---
+
+## 3. Piece 1: prefix-closed compression
+
+### 3.1 Definition
+Split the token sequence into blocks of B tokens. A compression policy is **prefix-closed with lookahead L** if, for every layer and KV head:
+1. The keep/drop decision for a token in block b depends only on tokens up to end(b) + L.
+2. Selection inside a block uses a fixed count (or a fixed threshold), never a ranking against the whole context.
+3. Block b becomes final once tokens up to end(b) + L exist, and is never re-ranked.
+
+Add **masked prefill**: once a block is final, every later token attends only to that block's kept entries. Tokens inside the lookahead window still see the block in full.
+
+Condition 2 is the one that matters most. A global top-k breaks closure for any scorer, because whether token i survives depends on how many later tokens outscore it. That is why SnapKV, KVzip (2505.23416), Expected Attention (2510.00636) and TriAttention (2604.04921), as published, are not prefix-closed. StreamingLLM (position rule), DMS (2506.05345; decision at creation, executed 256 tokens later) and KVzap (2601.07891) in threshold mode already satisfy the property, but no paper names it or uses it for cross-request sharing.
+
+### 3.2 The sharing proposition (to state and prove)
+Assume a prefix-closed policy, masked prefill, block-aligned finalization and deterministic arithmetic. Then for any prompt P and any continuation X: the keep-masks of all blocks finalized within P are identical whether the model reads P alone or P + X; the stored keys and values at every position in P are identical; and a server that stores P's finalized compressed blocks plus P's dense unfinalized tail, then resumes prefill on X, produces exactly the same cache and logits as a server that prefills P + X from scratch.
+
+Proof sketch: induction on position. Under causal attention, the hidden state at position t depends only on tokens up to t and on the masks of blocks finalized before t. By closure, each such mask depends only on tokens up to its own finalization point, which is earlier than t. So everything at positions up to |P| is a function of P alone. A radix-tree hit therefore returns what a miss would build. The unfinalized tail (last partial block plus the lookahead) stays dense, which mirrors how vLLM and SGLang already treat sliding-window layers (a dense trailing window, tombstones for missing slots).
+
+### 3.3 The kernel-friendly design
+Keep the **same count k per block for every head and layer**, while each head picks its own tokens. The cache stays rectangular: stock paged-attention kernels, vLLM's shared block table and HF's DynamicCache all work unchanged. This removes the ragged per-head paging that Tangram, KVzap and DMS need. Stored keys are post-RoPE at their original positions, so kernels need no per-head position indices. Keep logical positions; never renumber survivors.
+
+The cost is losing per-head budget adaptivity (Ada-KV style). That matters at high compression, not at the 2-4x this piece targets.
+
+### 3.4 Scorer v1 (training-free)
+Blocks B = 64, lookahead L in {64, 256, 1024}. When block b is finalized, score each of its tokens per KV head by the attention it receives from the L lookahead queries (SnapKV's signal with a fixed causal window), max-pooled. Keep k per block, same k for every head and layer. Always keep sinks. An Expected-Attention-style variant (calibrated query statistics, no lookahead needed) is the second scorer and may be stronger because plain window scoring collapses at high compression (Expected Attention 65.4 vs SnapKV 19.2 on RULER-4K at 90% compression, query excluded).
+
+### 3.5 The limit
+Prefix-closed compression cannot see the future question, so it is query-agnostic by construction. The minimax analysis (arXiv 2607.01520) shows query-agnostic error scales with the full trace of the key covariance and that sharp lookup contexts compressed to half size can incur maximal error. The owner's own experiments confirmed it: every query-agnostic sampler scored near 0 on RULER needle tasks at 25% kept. Therefore the eviction piece targets **2-4x on shared prefixes**, not 10x. Higher compression is piece 2's job.
+
+---
+
+## 4. Piece 2: don't evict, index and offload
+
+### 4.1 Design
+- Full KV lives in host (CPU) memory, in pages.
+- The GPU holds a compact **index**: the CrossCov-U rank-r projection of each key (r = 32, bf16). For an 8B GQA model at 128K tokens this is about 2 GB, versus roughly 16 GB for the full KV.
+- Per decode step: project the query, score it against the index, select the top tokens **once per GQA group** (not per query head, so the fetch set is shared), fetch the selected pages over PCIe, run attention on the fetched set.
+- Amortization: compute selections at a few layers and reuse for adjacent layers (IndexCache 2603.12201 removes 75% of indexer work this way); reuse the previous step's selection and repair misses (PIVOT 2607.24593, Predict-Reuse-Repair 2606.30389).
+- Nothing is evicted, so the design is **reversible**; the question is known at decode time, so there is no query-agnostic floor.
+
+### 4.2 Why CrossCov-U finally pays here
+On a GPU-resident cache, a better projection saves nothing: the full cache still occupies HBM, and the scan, top-k and gather still run. With the cache offloaded, the cost per step is **bytes fetched over PCIe plus a small GPU index scan**. Selection quality then sets speed: every token the index wrongly skips is a miss (accuracy loss or a repair fetch), every token it wrongly fetches is wasted bandwidth. Higher recall at a fixed rank means fewer bytes per step at the same accuracy. SAKI's 0.748 to 0.799 recall gain at r=32 is the size of headroom to expect from a score-aware basis.
+
+### 4.3 The index is prefix-closed for free
+Each token's projection depends only on its own key and a fixed calibrated basis. So index blocks are a deterministic function of the token prefix and can live in the radix tree, shared across requests, with no extra design. Piece 2 therefore meets both adoption criteria on its own: prefix compatibility and reversibility.
+
+### 4.4 The combined system
+Prefill: compute KV, write full KV pages to host memory, compute index blocks, store index blocks in the radix tree. Optionally apply the prefix-closed eviction of piece 1 to the GPU-resident hot set (recent tokens and sinks) so the resident footprint is rectangular and shareable. Decode: index scan, group-shared selection, page fetch, attention. Cost model: bytes fetched per step + index scan, versus the dense baseline's HBM reads.
+
+---
+
+## 5. Prior art and positioning (must cite)
+
+| Paper | What it already has | Difference |
+|---|---|---|
+| IntentKV 2606.09916 | Eviction that keeps radix matching alive (20.7% hits) | Masks slots, does not free memory; scores depend on session memory and the current query, so not prefix-closed |
+| FlowKV 2505.15347 | Never re-compresses earlier turns | Turn-level only, one conversation, no engine |
+| KVzap 2601.07891 | Causal per-token surrogate with fixed threshold (prefix-closed by construction) | Never mentions prefix caching; ragged per-head lengths; trained surrogate |
+| DMS 2506.05345 | Decision at creation + fixed delay; per-head pages | Needs retrofit training; ragged; no sharing |
+| KVzip 2505.23416 | Compress once, reuse across queries | Global top-r%, not closed; one fixed boundary; ~2x prefill cost |
+| Tangram 2606.06302 | Ragged per-head paging on vLLM | Never mentions prefix caching; offline calibration; not released |
+| HiSparse 2608.07009 | Full KV in host memory, GPU hot set | Per-request, per-layer cache; no cross-request sharing; radix cache disabled in its example |
+| ShadowKV 2410.21465 | Low-rank pre-RoPE keys on GPU, values on CPU, landmark selection, ~3x throughput | Plain low-rank keys; no score-aware basis; no sharing property |
+| Fathom 2609.17652 | Offloaded index with adaptive read depth, 1.67x over Loki-class scans | The rival index; compare head to head |
+| SAKI 2608.03228 | Score-aware covariance-weighted projection, recall only | The projection baseline for CrossCov-U; no runtime |
+| Loki 2406.02542 | Low-rank key scoring | No KV memory reduction; top-k bottleneck stated as open |
+| Context-intensive failure study 2604.08426 | Low-rank keys and landmarks degrade on context-intensive tasks | The evaluation risk; include those tasks |
+| Risk of KV compression 2607.01520 | Query-agnostic floor | Explains why piece 1 stops at 2-4x |
+| TensorRT-LLM docs; vLLM RFCs #2614, #12254; SGLang unified radix cache and HiSparse blogs | What engines actually do | The motivation |
+
+What is new: the named property and the hit-equals-miss proposition; head-uniform block selection on stock kernels; the first cross-request measurements of a prefix-closed scorer with prefix caching on; a score-aware index in the offloaded regime with the sharing property. The reviewer attack will be "DMS or KVzap-threshold plus a sliding-window radix component" for piece 1 and "ShadowKV with a different projection" for piece 2. The answers are the proposition, the stock-kernel design, the cross-request numbers, and bytes-per-step at matched accuracy.
+
+Scoop risk is high: IntentKV, Leyline, Tangram, HiSparse and the SGLang unified radix cache all landed June-August 2026, and NVIDIA owns DMS, KVzap and TensorRT-LLM. An engine PR combining threshold eviction with prefix caching may exist; search vLLM, SGLang and TensorRT-LLM issues and PRs in the first session.
+
+---
+
+## 6. Kill gates, cheapest first
+
+Hardware assumed: one 48 GB GPU (RTX A6000) with host RAM of at least 64 GB, plus the owner's work server. Models: Qwen3-4B for fast iteration, Llama-3.1-8B-Instruct for comparability with the kvpress leaderboard and with ShadowKV/Fathom.
+
+**K0 — equivalence (minutes, any GPU).** Implement the prefix-closed scorer in HF with chunked prefill. Run on a prompt P and on P + X. Finalized keep-masks must match byte for byte. Then simulate a cache hit (store P's compressed blocks and dense tail, resume on X) and a miss (prefill P + X from scratch): suffix logits must be equal up to bf16 reordering (report max abs diff; expect ~1e-3 or less). Watch for floating-point ties flipping a per-block top-k; compute block decisions in one canonical pass with deterministic kernels, or break ties by position.
+
+**I0 — index quality, offline (~1 GPU-hour).** Capture pre-RoPE keys and held-out queries from 20 long-context prompts (RULER 16K/32K, plus 5 context-intensive prompts per 2604.08426's task types). For PCA (Loki), CrossCov-U and SAKI at ranks 16/32/64, compute recall-at-k for k in {64, 256, 1024} and bytes-to-reach-95%-recall. Pass: CrossCov-U cuts bytes by 15-20% at matched recall versus PCA. If it ties SAKI, adopt SAKI's projection as the baseline and make the runtime the contribution.
+
+**K1 — eviction quality (10-20 GPU-hours).** Qwen3-4B and Llama-3.1-8B at 2x, 4x, 8x on RULER (4K, 16K), LongBench and SCBench shared-context tasks, through kvpress with the query excluded. Compare prefix-closed v1 (several L, both scorers) against dense-then-compress SnapKV, KVzip, Expected Attention, KVzap. Pass: within about 2 points of the best baseline at 4x. Also sweep needle position within the block to check for phase effects (Periodic Weak Spots, 2609.36322, found up to 40-point gaps from fixed chunk boundaries); if a gap appears, score each token from its own window [i+1, i+L], which stays prefix-closed. Fail: publish the "price of closure" curve as a short analysis.
+
+**K2 — sharing value (CPU plus a few GPU-hours).** Replay multi-request traces (SCBench, multi-turn chat, agent trajectories) and compute hit rate and memory per request for: no compression; compaction eviction; IntentKV-style masking; prefix-closed compression; and the index-only design. Pass: clear memory-per-request win at matched hit rate.
+
+**I1 — offloaded decode (~10 GPU-hours).** Build the index-plus-offload path in HF first (host-pinned KV pages, GPU index, group-shared selection, page fetch). Measure accuracy versus bytes transferred per step and decode latency at 64K and 128K context, batch 1 and 8, for PCA index, CrossCov-U index, SAKI index, and a dense baseline. Include the context-intensive tasks. Pass: CrossCov-U index reaches the dense baseline's accuracy with fewer bytes per step than PCA, and the end-to-end decode at 128K is faster than dense on the same GPU.
+
+**K3 — engine (2-3 weeks of engineering, ~10 GPU-hours).** SGLang radix cache storing finalized compressed blocks and index blocks; throughput and latency on an 8B model under shared-prefix workloads. A junior can own this once K0-K2 and I0-I1 pass.
+
+---
+
+## 7. Implementation plan for Claude Code
+
+Repository layout (new repo, reuse code from `neymankv` by copying the capture, kvpress pipeline and stats modules):
+```
+sharekv/
+  closure/      # block finalization, lookahead scoring, head-uniform selection, masked prefill, hit/miss simulator
+  index/        # CrossCov-U, PCA, SAKI projections; calibration; group-shared selection; selection reuse
+  offload/      # host-pinned KV pages, fetch scheduler, bytes accounting
+  capture/      # hooks (pre/post-RoPE keys, values, queries, positions)
+  eval/         # kvpress pipeline, RULER/LongBench/SCBench, paired bootstrap
+  tests/        # synthetic tests, run before any GPU job
+  runs/         # configs, CSVs, REPORT.md per phase, provenance (git commit, pip freeze, GPU, seeds, GPU-hours)
+```
+Synthetic tests before any GPU job: full-budget identity (no eviction reproduces full attention); prefix-closure on random tensors (masks for P equal masks for P+X); hit-equals-miss on random tensors; index recall sanity (rank d reproduces exact top-k); offload path correctness (fetched attention equals dense attention when everything is fetched).
+
+Harness rules learned the hard way in the previous project: read tokenizers from `tokenizer.json` and assert a round-trip of "Hello world" (transformers 5.7 drops spaces for some models); use SDPA, not bf16 eager attention (it rounds scores before the softmax); match evaluation samples on task, question and answer, never on a salted hash; log kept-set sizes per head to verify budgets; never report differences without paired bootstrap intervals (differences under 8 points were noise throughout the previous project).
+
+Order of work: K0 and the synthetic tests (day 1); I0 (day 1-2); K1 and I1 in parallel (week 1-2); K2 (week 2); decide; K3 (weeks 3-5).
+
+---
+
+## 8. Paper framing
+
+Venue: MLSys, or NeurIPS/ICLR with the systems angle. One-line claim: "A KV cache that engines can share and recover: prefix-closed, reversible, on stock kernels, with a score-aware index that makes offloading fast."
+
+Contributions in order: (1) the prefix-closure property and the hit-equals-miss proposition; (2) a head-uniform block design that runs on stock paged kernels; (3) a score-aware GPU index over an offloaded cache that is prefix-closed by construction, with bytes-per-step as the metric; (4) cross-request measurements with prefix caching on, which no paper has reported.
+
+Framings to avoid: "we invented low-rank key indexing" (Loki, ShadowKV, SAKI); "our projection is better" as the headline (SAKI owns that; the headline is the system); "lossless" for piece 1 (it is exact for hits versus misses, not lossless versus a full cache).
+
+---
+
+## 9. What not to do
+- Do not evaluate piece 1 above 4x and expect it to compete with query-aware methods; the floor is proven.
+- Do not benchmark the index on a GPU-resident cache; the speedup only exists when offloaded.
+- Do not skip the context-intensive tasks; low-rank keys are known to fail there.
+- Do not write the theory claim before searching vLLM, SGLang and TensorRT-LLM PRs for an existing threshold-eviction-plus-prefix-caching integration.
+
+---
+
+## 10. First message to give Claude Code
+
+"Read this document fully. Set up the `sharekv` repository as in Section 7, copying the capture, kvpress pipeline and statistics modules from the `neymankv` repository. Write the synthetic tests first and run them. Then run K0 (prefix-closure equivalence) on Qwen3-4B and report the max logit difference between a simulated cache hit and a miss. Then run I0 (index quality) on 20 captured prompts and report recall-at-k and bytes-to-95%-recall for PCA, CrossCov-U and SAKI at ranks 16/32/64. Stop after I0 and report both gates with numbers. Do not start K1 or I1 until the owner has seen K0 and I0."
